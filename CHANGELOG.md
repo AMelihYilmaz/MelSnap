@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4
+
+- Filter screenshots by Today, Last 7 Days, or All Dates.
+- Cycle through highlighted matches with arrow buttons or arrow keys.
+
 ## v0.3
 
 ### Added

@@ -19,6 +19,7 @@ struct TextLine: Sendable {
 struct Match: Identifiable, Sendable {
     let url: URL
     let lines: [TextLine]
+    let date: Date?
     var id: URL { url }
 
     func highlights(for query: String) -> [CGRect] {
@@ -32,6 +33,7 @@ struct Match: Identifiable, Sendable {
 }
 
 struct FileStamp: Equatable, Sendable {
+    let created: Date?
     let modified: Date?
     let bytes: Int?
 }
@@ -41,7 +43,7 @@ struct Entry: Sendable {
     let match: Match?
 }
 
-func recognize(_ url: URL) -> Match? {
+func recognize(_ url: URL, date: Date?) -> Match? {
     let request = VNRecognizeTextRequest()
     request.recognitionLevel = .fast
     let supported = (try? request.supportedRecognitionLanguages()) ?? []
@@ -63,7 +65,7 @@ func recognize(_ url: URL) -> Match? {
             }
             return TextLine(text: text, box: observation.boundingBox, words: words)
         }
-        return Match(url: url, lines: lines)
+        return Match(url: url, lines: lines, date: date)
     } catch {
         return nil
     }
@@ -71,7 +73,7 @@ func recognize(_ url: URL) -> Match? {
 
 func refresh(_ folder: URL, previous: [URL: Entry]) async -> [URL: Entry]? {
     let types: Set<String> = ["png", "jpg", "jpeg", "heic", "tiff", "webp"]
-    let keys: Set<URLResourceKey> = [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey]
+    let keys: Set<URLResourceKey> = [.isRegularFileKey, .creationDateKey, .contentModificationDateKey, .fileSizeKey]
     guard let files = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: Array(keys),
                                                        options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return nil }
     var next: [URL: Entry] = [:]
@@ -80,7 +82,7 @@ func refresh(_ folder: URL, previous: [URL: Entry]) async -> [URL: Entry]? {
         if Task.isCancelled { return nil }
         guard types.contains(url.pathExtension.lowercased()),
               let values = try? url.resourceValues(forKeys: keys), values.isRegularFile == true else { continue }
-        let stamp = FileStamp(modified: values.contentModificationDate, bytes: values.fileSize)
+        let stamp = FileStamp(created: values.creationDate, modified: values.contentModificationDate, bytes: values.fileSize)
         if let old = previous[url], old.stamp == stamp {
             next[url] = old
         } else {
@@ -92,7 +94,7 @@ func refresh(_ folder: URL, previous: [URL: Entry]) async -> [URL: Entry]? {
         func enqueue() {
             guard let (url, stamp) = jobs.next() else { return }
             group.addTask {
-                (url, Entry(stamp: stamp, match: Task.isCancelled ? nil : recognize(url)))
+                (url, Entry(stamp: stamp, match: Task.isCancelled ? nil : recognize(url, date: stamp.created ?? stamp.modified)))
             }
         }
         for _ in 0..<min(3, pending.count) { enqueue() }
@@ -162,6 +164,7 @@ struct ImagePreview: View {
     let url: URL
     let boxes: [CGRect]
     let limit: Int
+    var selected: Int? = nil
     @StateObject private var model = PreviewModel()
 
     var body: some View {
@@ -172,9 +175,9 @@ struct ImagePreview: View {
                 let height = CGFloat(image.height) * scale
                 ZStack(alignment: .topLeading) {
                     Image(decorative: image, scale: 1).resizable()
-                    ForEach(Array(boxes.enumerated()), id: \.offset) { _, box in
-                        Rectangle().fill(.yellow.opacity(0.38))
-                            .overlay(Rectangle().strokeBorder(.yellow, lineWidth: 1))
+                    ForEach(Array(boxes.enumerated()), id: \.offset) { index, box in
+                        Rectangle().fill(.yellow.opacity(selected == index ? 0.65 : 0.24))
+                            .overlay(Rectangle().strokeBorder(selected == index ? .orange : .yellow, lineWidth: selected == index ? 2 : 1))
                             .frame(width: box.width * width, height: box.height * height)
                             .offset(x: box.minX * width, y: (1 - box.maxY) * height)
                     }
@@ -193,6 +196,8 @@ struct ImagePreview: View {
 @MainActor final class SearchModel: ObservableObject {
     @Published var results: [Match] = []
     @Published var query = ""
+    @Published var dateFilter = DateFilter.all
+    @Published var selected = 0
     @Published var status = "Choose your screenshot folder."
     @Published var opened: Match?
     @Published private(set) var folder: URL?
@@ -245,6 +250,20 @@ struct ImagePreview: View {
     deinit { watcher?.cancel() }
 }
 
+enum DateFilter: String, CaseIterable {
+    case all = "All Dates"
+    case today = "Today"
+    case week = "Last 7 Days"
+
+    func includes(_ date: Date?, now: Date, calendar: Calendar = .current) -> Bool {
+        if self == .all { return true }
+        let today = calendar.startOfDay(for: now)
+        guard let date, let start = calendar.date(byAdding: .day, value: self == .today ? 0 : -6, to: today),
+              let end = calendar.date(byAdding: .day, value: 1, to: today) else { return false }
+        return date >= start && date < end
+    }
+}
+
 struct SearchView: View {
     @StateObject private var model = SearchModel()
     @FocusState private var searchFocused: Bool
@@ -266,10 +285,17 @@ struct SearchView: View {
                     .keyboardShortcut("f", modifiers: .command)
                     .help("Focus search")
             }
-            Text(model.status).foregroundStyle(.secondary)
+            HStack {
+                Text(model.status).foregroundStyle(.secondary)
+                Spacer()
+                Picker("Date", selection: $model.dateFilter) {
+                    ForEach(DateFilter.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }.fixedSize()
+            }
+            let now = Date()
             List(model.results.filter {
-                model.term.isEmpty || $0.lines.contains { $0.text.localizedStandardContains(model.term) }
-                    || $0.url.lastPathComponent.localizedStandardContains(model.term)
+                model.dateFilter.includes($0.date, now: now) && (model.term.isEmpty || $0.lines.contains { $0.text.localizedStandardContains(model.term) }
+                    || $0.url.lastPathComponent.localizedStandardContains(model.term))
             }) { match in
                 HStack(spacing: 12) {
                     ImagePreview(url: match.url, boxes: [], limit: 200).frame(width: 96, height: 60)
@@ -279,19 +305,33 @@ struct SearchView: View {
                              ?? match.lines.first?.text ?? "").lineLimit(2).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button("Open") { model.opened = match }
+                    Button("Open") { model.selected = 0; model.opened = match }
                 }.buttonStyle(.borderless).padding(.vertical, 3)
             }
         }.padding().frame(minWidth: 660, minHeight: 440)
         .sheet(item: $model.opened) { match in
+            let boxes = match.highlights(for: model.term)
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
                     Text(match.url.lastPathComponent).bold()
                     Spacer()
+                    if !boxes.isEmpty {
+                        Button { model.selected = (model.selected + boxes.count - 1) % boxes.count } label: {
+                            Image(systemName: "chevron.left")
+                        }.accessibilityLabel("Previous match")
+                            .keyboardShortcut(.leftArrow, modifiers: [])
+                            .disabled(boxes.count < 2)
+                        Text("\(model.selected + 1) / \(boxes.count)").monospacedDigit()
+                        Button { model.selected = (model.selected + 1) % boxes.count } label: {
+                            Image(systemName: "chevron.right")
+                        }.accessibilityLabel("Next match")
+                            .keyboardShortcut(.rightArrow, modifiers: [])
+                            .disabled(boxes.count < 2)
+                    }
                     Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([match.url]) }
                     Button("Close") { model.opened = nil }.keyboardShortcut(.cancelAction)
                 }
-                ImagePreview(url: match.url, boxes: match.highlights(for: model.term), limit: 2200)
+                ImagePreview(url: match.url, boxes: boxes, limit: 2200, selected: model.selected)
             }.padding().frame(width: 820, height: 580)
         }
     }
@@ -305,5 +345,5 @@ struct SearchView: View {
 }
 
 @main struct MelSnap: App {
-    var body: some Scene { WindowGroup("MelSnap 0.3") { SearchView() } }
+    var body: some Scene { WindowGroup("MelSnap 0.4") { SearchView() } }
 }

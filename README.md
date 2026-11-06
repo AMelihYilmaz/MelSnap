@@ -1,13 +1,15 @@
-# MelSnap 0.3
+# MelSnap 0.4
 
 MelSnap is an open-source macOS app for finding screenshots by the text inside
 them. Apple Vision recognizes text on your Mac. Search data stays in memory.
 
 ## Use MelSnap
 
-Download the Apple Silicon ZIP from release **v0.3**, unzip it, and open
-**MelSnap 0.3.app**. Choose the folder where your screenshots are saved,
+Download the Apple Silicon ZIP from release **v0.4**, unzip it, and open
+**MelSnap 0.4.app**. Choose the folder where your screenshots are saved,
 then search for a word or phrase. While MelSnap is open, new and changed screenshots are indexed automatically.
+
+Filter by **Today**, **Last 7 Days**, or **All Dates**. MelSnap uses the file creation date, falling back to its modification date. In the preview, use the arrow buttons or arrow keys to cycle through matches.
 
 The release app is ad-hoc signed and has not been notarized by Apple.
 
