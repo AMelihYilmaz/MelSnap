@@ -3,6 +3,7 @@ import SwiftUI
 import Vision
 import ImageIO
 import Combine
+import CoreServices
 
 struct TextSpan: Sendable {
     let text: String
@@ -104,6 +105,46 @@ func refresh(_ folder: URL, previous: [URL: Entry]) async -> [URL: Entry]? {
     return Task.isCancelled ? nil : next
 }
 
+final class FolderEvents {
+    let events: AsyncStream<Void>
+    private let continuation: AsyncStream<Void>.Continuation
+    private var stream: FSEventStreamRef?
+
+    init?(_ folder: URL) {
+        (events, continuation) = AsyncStream.makeStream(bufferingPolicy: .bufferingNewest(1))
+        var context = FSEventStreamContext()
+        context.info = Unmanaged.passUnretained(self).toOpaque()
+        let flags = FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents
+                                            | kFSEventStreamCreateFlagNoDefer
+                                            | kFSEventStreamCreateFlagWatchRoot)
+        guard let stream = FSEventStreamCreate(nil, { _, info, _, _, _, _ in
+            guard let info else { return }
+            Unmanaged<FolderEvents>.fromOpaque(info).takeUnretainedValue().requestRefresh()
+        }, &context, [folder.path] as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+        0.15, flags) else { return nil }
+
+        FSEventStreamSetDispatchQueue(stream, .main)
+        guard FSEventStreamStart(stream) else {
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+            return nil
+        }
+        self.stream = stream
+        requestRefresh()
+    }
+
+    func requestRefresh() { continuation.yield(()) }
+
+    deinit {
+        continuation.finish()
+        if let stream {
+            FSEventStreamStop(stream)
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+        }
+    }
+}
+
 
 func loadImage(_ url: URL, limit: Int) -> CGImage? {
     guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
@@ -156,7 +197,7 @@ struct ImagePreview: View {
     @Published var opened: Match?
     @Published private(set) var folder: URL?
     private var watcher: Task<Void, Never>?
-    
+    private var monitor: FolderEvents?
 
     var term: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
 
@@ -165,11 +206,17 @@ struct ImagePreview: View {
         self.folder = folder
         results = []
         status = "Scanning \(folder.lastPathComponent)…"
-        
+        monitor = nil
+        guard let monitor = FolderEvents(folder) else {
+            status = "Could not watch the folder. Choose it again."
+            return
+        }
+        self.monitor = monitor
+        let events = monitor.events
         watcher = Task { [weak self] in
             var entries: [URL: Entry] = [:]
             var first = true
-            while !Task.isCancelled {
+            for await _ in events {
                 let worker = Task.detached { [entries] in await refresh(folder, previous: entries) }
                 let next = await withTaskCancellationHandler {
                     await worker.value
@@ -191,7 +238,7 @@ struct ImagePreview: View {
                 }
                 first = false
                 entries = next
-                try? await Task.sleep(for: .seconds(2))
+                
             }
         }
     }
@@ -204,7 +251,16 @@ struct SearchView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Button("Choose Folder…", action: chooseFolder)
+                Menu {
+                    Button("Choose Folder…", action: chooseFolder).keyboardShortcut("o", modifiers: .command)
+                    Button("Open Folder in Finder") { if let folder = model.folder { NSWorkspace.shared.open(folder) } }
+                        .disabled(model.folder == nil)
+                    Divider()
+                    Button("Rescan Folder") { if let folder = model.folder { model.watch(folder) } }
+                        .disabled(model.folder == nil)
+                } label: {
+                    Label(model.folder?.lastPathComponent ?? "Folder", systemImage: "folder")
+                }.fixedSize().accessibilityLabel("Folder actions")
                 TextField("Search text in images", text: $model.query).focused($searchFocused)
                 Button { searchFocused = true } label: { Image(systemName: "magnifyingglass") }
                     .keyboardShortcut("f", modifiers: .command)
@@ -249,5 +305,5 @@ struct SearchView: View {
 }
 
 @main struct MelSnap: App {
-    var body: some Scene { WindowGroup("MelSnap 0.2") { SearchView() } }
+    var body: some Scene { WindowGroup("MelSnap 0.3") { SearchView() } }
 }

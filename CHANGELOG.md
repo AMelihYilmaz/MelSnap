@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3
+
+### Added
+- Add a folder menu with Choose Folder, Open in Finder, and Rescan Folder.
+- Add Command-O for folder selection and a custom MelSnap app icon.
+
+### Improved
+- Start refreshing on macOS file notifications instead of a two-second polling interval.
+- Ship an English interface, README, and versioned Apple Silicon download.
+
 ## v0.2
 
 ### Added
