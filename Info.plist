@@ -3,18 +3,18 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>MelSnap 0.1</string>
+	<string>MelSnap 0.2</string>
 	<key>CFBundleExecutable</key>
 	<string>MelSnap</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.melsnap.app</string>
 	<key>CFBundleName</key>
-	<string>MelSnap 0.1</string>
+	<string>MelSnap 0.2</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 </dict>
 </plist>

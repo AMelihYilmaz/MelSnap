@@ -1,90 +1,253 @@
 import AppKit
 import SwiftUI
 import Vision
+import ImageIO
 import Combine
+
+struct TextSpan: Sendable {
+    let text: String
+    let box: CGRect
+}
+
+struct TextLine: Sendable {
+    let text: String
+    let box: CGRect
+    let words: [TextSpan]
+}
 
 struct Match: Identifiable, Sendable {
     let url: URL
-    let text: String
+    let lines: [TextLine]
     var id: URL { url }
-}
 
-func indexImages(in folder: URL) -> ([Match], Int) {
-    let types = Set(["png", "jpg", "jpeg", "heic", "tiff", "webp"])
-    let files = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: [.isRegularFileKey],
-                                               options: [.skipsHiddenFiles, .skipsPackageDescendants])
-    var matches: [Match] = []
-    var failures = 0
-    while let url = files?.nextObject() as? URL {
-        guard types.contains(url.pathExtension.lowercased()),
-              (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else { continue }
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        let supported = (try? request.supportedRecognitionLanguages()) ?? []
-        let languages = ["tr-TR", "en-US"].filter { supported.contains($0) }
-        if !languages.isEmpty { request.recognitionLanguages = languages }
-        do {
-            try VNImageRequestHandler(url: url).perform([request])
-            let lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
-            matches.append(Match(url: url, text: lines.joined(separator: "\n")))
-        } catch {
-            failures += 1
+    func highlights(for query: String) -> [CGRect] {
+        guard !query.isEmpty else { return [] }
+        return lines.flatMap { line in
+            let boxes = line.words.filter { $0.text.localizedStandardContains(query) }.map(\.box)
+            if !boxes.isEmpty { return boxes }
+            return line.text.localizedStandardContains(query) ? [line.box] : []
         }
     }
-    return (matches.sorted { $0.url.lastPathComponent.localizedStandardCompare($1.url.lastPathComponent) == .orderedAscending }, failures)
+}
+
+struct FileStamp: Equatable, Sendable {
+    let modified: Date?
+    let bytes: Int?
+}
+
+struct Entry: Sendable {
+    let stamp: FileStamp
+    let match: Match?
+}
+
+func recognize(_ url: URL) -> Match? {
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .fast
+    let supported = (try? request.supportedRecognitionLanguages()) ?? []
+    let languages = ["tr-TR", "en-US"].filter { supported.contains($0) }
+    if !languages.isEmpty { request.recognitionLanguages = languages }
+    do {
+        let source = CGImageSourceCreateWithURL(url as CFURL, nil)
+        let properties = source.flatMap { CGImageSourceCopyPropertiesAtIndex($0, 0, nil) } as? [CFString: Any]
+        let orientation = (properties?[kCGImagePropertyOrientation] as? UInt32)
+            .flatMap(CGImagePropertyOrientation.init(rawValue:)) ?? .up
+        try VNImageRequestHandler(url: url, orientation: orientation).perform([request])
+        let lines = (request.results ?? []).compactMap { observation -> TextLine? in
+            guard let candidate = observation.topCandidates(1).first else { return nil }
+            let text = candidate.string
+            var words: [TextSpan] = []
+            text.enumerateSubstrings(in: text.startIndex..<text.endIndex, options: .byWords) { word, range, _, _ in
+                guard let word, let region = try? candidate.boundingBox(for: range) else { return }
+                words.append(TextSpan(text: word, box: region.boundingBox))
+            }
+            return TextLine(text: text, box: observation.boundingBox, words: words)
+        }
+        return Match(url: url, lines: lines)
+    } catch {
+        return nil
+    }
+}
+
+func refresh(_ folder: URL, previous: [URL: Entry]) async -> [URL: Entry]? {
+    let types: Set<String> = ["png", "jpg", "jpeg", "heic", "tiff", "webp"]
+    let keys: Set<URLResourceKey> = [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey]
+    guard let files = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: Array(keys),
+                                                       options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return nil }
+    var next: [URL: Entry] = [:]
+    var pending: [(URL, FileStamp)] = []
+    while let url = files.nextObject() as? URL {
+        if Task.isCancelled { return nil }
+        guard types.contains(url.pathExtension.lowercased()),
+              let values = try? url.resourceValues(forKeys: keys), values.isRegularFile == true else { continue }
+        let stamp = FileStamp(modified: values.contentModificationDate, bytes: values.fileSize)
+        if let old = previous[url], old.stamp == stamp {
+            next[url] = old
+        } else {
+            pending.append((url, stamp))
+        }
+    }
+    await withTaskGroup(of: (URL, Entry).self) { group in
+        var jobs = pending.makeIterator()
+        func enqueue() {
+            guard let (url, stamp) = jobs.next() else { return }
+            group.addTask {
+                (url, Entry(stamp: stamp, match: Task.isCancelled ? nil : recognize(url)))
+            }
+        }
+        for _ in 0..<min(3, pending.count) { enqueue() }
+        for await (url, entry) in group {
+            if Task.isCancelled { group.cancelAll(); break }
+            next[url] = entry
+            enqueue()
+        }
+    }
+    return Task.isCancelled ? nil : next
 }
 
 
-final class SearchModel: ObservableObject {
+func loadImage(_ url: URL, limit: Int) -> CGImage? {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+    let options = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                   kCGImageSourceCreateThumbnailWithTransform: true,
+                   kCGImageSourceThumbnailMaxPixelSize: limit] as CFDictionary
+    return CGImageSourceCreateThumbnailAtIndex(source, 0, options)
+}
+
+final class PreviewModel: ObservableObject {
+    @Published var image: CGImage?
+}
+
+struct ImagePreview: View {
+    let url: URL
+    let boxes: [CGRect]
+    let limit: Int
+    @StateObject private var model = PreviewModel()
+
+    var body: some View {
+        GeometryReader { geometry in
+            if let image = model.image {
+                let scale = min(geometry.size.width / CGFloat(image.width), geometry.size.height / CGFloat(image.height))
+                let width = CGFloat(image.width) * scale
+                let height = CGFloat(image.height) * scale
+                ZStack(alignment: .topLeading) {
+                    Image(decorative: image, scale: 1).resizable()
+                    ForEach(Array(boxes.enumerated()), id: \.offset) { _, box in
+                        Rectangle().fill(.yellow.opacity(0.38))
+                            .overlay(Rectangle().strokeBorder(.yellow, lineWidth: 1))
+                            .frame(width: box.width * width, height: box.height * height)
+                            .offset(x: box.minX * width, y: (1 - box.maxY) * height)
+                    }
+                }.frame(width: width, height: height)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                Image(systemName: "photo").frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }.task(id: url) {
+            let image = await Task.detached(priority: .utility) { loadImage(url, limit: limit) }.value
+            if !Task.isCancelled { model.image = image }
+        }.accessibilityLabel("Image preview")
+    }
+}
+
+@MainActor final class SearchModel: ObservableObject {
     @Published var results: [Match] = []
     @Published var query = ""
     @Published var status = "Choose your screenshot folder."
-    @Published var busy = false
+    @Published var opened: Match?
+    @Published private(set) var folder: URL?
+    private var watcher: Task<Void, Never>?
+    
+
+    var term: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    func watch(_ folder: URL) {
+        watcher?.cancel()
+        self.folder = folder
+        results = []
+        status = "Scanning \(folder.lastPathComponent)…"
+        
+        watcher = Task { [weak self] in
+            var entries: [URL: Entry] = [:]
+            var first = true
+            while !Task.isCancelled {
+                let worker = Task.detached { [entries] in await refresh(folder, previous: entries) }
+                let next = await withTaskCancellationHandler {
+                    await worker.value
+                } onCancel: {
+                    worker.cancel()
+                }
+                guard !Task.isCancelled, let self else { return }
+                guard let next else {
+                    self.status = "Could not read the folder."
+                    return
+                }
+                if first || next.mapValues(\.stamp) != entries.mapValues(\.stamp) {
+                    self.results = next.values.compactMap(\.match).sorted {
+                        $0.url.lastPathComponent.localizedStandardCompare($1.url.lastPathComponent) == .orderedAscending
+                    }
+                    self.status = "Watching \(folder.lastPathComponent) · \(self.results.count) images"
+                    let failures = next.count - self.results.count
+                    if failures > 0 { self.status += " · \(failures) unreadable" }
+                }
+                first = false
+                entries = next
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+    }
+    deinit { watcher?.cancel() }
 }
 
 struct SearchView: View {
     @StateObject private var model = SearchModel()
+    @FocusState private var searchFocused: Bool
     var body: some View {
-        VStack(alignment: .leading) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Button("Choose Folder…", action: chooseFolder).disabled(model.busy)
-                TextField("Search text in images", text: $model.query)
-                if model.busy { ProgressView().controlSize(.small) }
+                Button("Choose Folder…", action: chooseFolder)
+                TextField("Search text in images", text: $model.query).focused($searchFocused)
+                Button { searchFocused = true } label: { Image(systemName: "magnifyingglass") }
+                    .keyboardShortcut("f", modifiers: .command)
+                    .help("Focus search")
             }
             Text(model.status).foregroundStyle(.secondary)
             List(model.results.filter {
-                model.query.isEmpty || $0.text.localizedStandardContains(model.query)
-                    || $0.url.lastPathComponent.localizedStandardContains(model.query)
+                model.term.isEmpty || $0.lines.contains { $0.text.localizedStandardContains(model.term) }
+                    || $0.url.lastPathComponent.localizedStandardContains(model.term)
             }) { match in
-                HStack {
+                HStack(spacing: 12) {
+                    ImagePreview(url: match.url, boxes: [], limit: 200).frame(width: 96, height: 60)
                     VStack(alignment: .leading) {
                         Text(match.url.lastPathComponent).bold()
-                        Text(match.text).lineLimit(2).foregroundStyle(.secondary)
+                        Text(match.lines.first { !model.term.isEmpty && $0.text.localizedStandardContains(model.term) }?.text
+                             ?? match.lines.first?.text ?? "").lineLimit(2).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button("Open") { NSWorkspace.shared.open(match.url) }
-                    Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([match.url]) }
-                }.buttonStyle(.borderless)
+                    Button("Open") { model.opened = match }
+                }.buttonStyle(.borderless).padding(.vertical, 3)
             }
         }.padding().frame(minWidth: 660, minHeight: 440)
+        .sheet(item: $model.opened) { match in
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text(match.url.lastPathComponent).bold()
+                    Spacer()
+                    Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([match.url]) }
+                    Button("Close") { model.opened = nil }.keyboardShortcut(.cancelAction)
+                }
+                ImagePreview(url: match.url, boxes: match.highlights(for: model.term), limit: 2200)
+            }.padding().frame(width: 820, height: 580)
+        }
     }
 
     private func chooseFolder() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
-        guard panel.runModal() == .OK, let folder = panel.url else { return }
-        model.busy = true
-        model.status = "Scanning \(folder.lastPathComponent)…"
-        Task {
-            let (results, failures) = await Task.detached { indexImages(in: folder) }.value
-            model.results = results
-            model.status = "\(results.count) images · \(failures) unreadable"
-            model.busy = false
-        }
+        if panel.runModal() == .OK, let folder = panel.url { model.watch(folder) }
     }
 }
 
 @main struct MelSnap: App {
-    var body: some Scene { WindowGroup("MelSnap 0.1") { SearchView() } }
+    var body: some Scene { WindowGroup("MelSnap 0.2") { SearchView() } }
 }
