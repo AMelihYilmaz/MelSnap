@@ -5,18 +5,18 @@ import ImageIO
 import Combine
 import CoreServices
 
-struct TextSpan: Sendable {
+struct TextSpan: Codable, Sendable {
     let text: String
     let box: CGRect
 }
 
-struct TextLine: Sendable {
+struct TextLine: Codable, Sendable {
     let text: String
     let box: CGRect
     let words: [TextSpan]
 }
 
-struct Match: Identifiable, Sendable {
+struct Match: Codable, Identifiable, Sendable {
     let url: URL
     let lines: [TextLine]
     let date: Date?
@@ -32,13 +32,13 @@ struct Match: Identifiable, Sendable {
     }
 }
 
-struct FileStamp: Equatable, Sendable {
+struct FileStamp: Codable, Equatable, Sendable {
     let created: Date?
     let modified: Date?
     let bytes: Int?
 }
 
-struct Entry: Sendable {
+struct Entry: Codable, Sendable {
     let stamp: FileStamp
     let match: Match?
 }
@@ -83,7 +83,7 @@ func refresh(_ folder: URL, previous: [URL: Entry]) async -> [URL: Entry]? {
         guard types.contains(url.pathExtension.lowercased()),
               let values = try? url.resourceValues(forKeys: keys), values.isRegularFile == true else { continue }
         let stamp = FileStamp(created: values.creationDate, modified: values.contentModificationDate, bytes: values.fileSize)
-        if let old = previous[url], old.stamp == stamp {
+        if let old = previous[url], old.stamp == stamp, old.match != nil {
             next[url] = old
         } else {
             pending.append((url, stamp))
@@ -193,23 +193,81 @@ struct ImagePreview: View {
     }
 }
 
+struct SavedIndex: Codable {
+    let version: Int
+    let folder: URL
+    let entries: [String: Entry]
+}
+
+struct IndexStore {
+    let url: URL
+    init(url: URL? = nil) {
+        self.url = url ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MelSnap/index.json")
+    }
+    func load() -> SavedIndex? {
+        guard let data = try? Data(contentsOf: url),
+              let index = try? JSONDecoder().decode(SavedIndex.self, from: data),
+              index.version == 1 else { return nil }
+        return index
+    }
+    func save(folder: URL, entries: [URL: Entry]) throws {
+        let directory = url.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        let index = SavedIndex(version: 1, folder: folder,
+                               entries: Dictionary(uniqueKeysWithValues: entries.map { ($0.key.path, $0.value) }))
+        try JSONEncoder().encode(index).write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+    func clear() throws {
+        if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+    }
+}
+
 @MainActor final class SearchModel: ObservableObject {
     @Published var results: [Match] = []
     @Published var query = ""
     @Published var dateFilter = DateFilter.all
     @Published var selected = 0
+    @Published var previewZoom = 1.0
     @Published var status = "Choose your screenshot folder."
     @Published var opened: Match?
     @Published private(set) var folder: URL?
     private var watcher: Task<Void, Never>?
     private var monitor: FolderEvents?
 
+    private let store = IndexStore()
+
+    init() {
+        if let saved = store.load() { watch(saved.folder) }
+    }
+
+    func clearIndex() {
+        watcher?.cancel()
+        watcher = nil
+        monitor = nil
+        do {
+            try store.clear()
+            folder = nil
+            results = []
+            opened = nil
+            status = "Search data cleared. Choose a folder to start again."
+        } catch { status = "Could not clear saved data: " + error.localizedDescription }
+    }
+
     var term: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
 
     func watch(_ folder: URL) {
         watcher?.cancel()
         self.folder = folder
-        results = []
+        let saved = store.load()
+        let cached: [URL: Entry] = saved?.folder == folder
+            ? Dictionary(uniqueKeysWithValues: (saved?.entries ?? [:]).map { (URL(fileURLWithPath: $0.key), $0.value) })
+            : [:]
+        results = cached.values.compactMap(\.match).sorted {
+            $0.url.lastPathComponent.localizedStandardCompare($1.url.lastPathComponent) == .orderedAscending
+        }
         status = "Scanning \(folder.lastPathComponent)…"
         monitor = nil
         guard let monitor = FolderEvents(folder) else {
@@ -219,7 +277,7 @@ struct ImagePreview: View {
         self.monitor = monitor
         let events = monitor.events
         watcher = Task { [weak self] in
-            var entries: [URL: Entry] = [:]
+            var entries: [URL: Entry] = cached
             var first = true
             for await _ in events {
                 let worker = Task.detached { [entries] in await refresh(folder, previous: entries) }
@@ -233,7 +291,7 @@ struct ImagePreview: View {
                     self.status = "Could not read the folder."
                     return
                 }
-                if first || next.mapValues(\.stamp) != entries.mapValues(\.stamp) {
+                if first || next.mapValues(\.stamp) != entries.mapValues(\.stamp) || next.mapValues({ $0.match == nil }) != entries.mapValues({ $0.match == nil }) {
                     self.results = next.values.compactMap(\.match).sorted {
                         $0.url.lastPathComponent.localizedStandardCompare($1.url.lastPathComponent) == .orderedAscending
                     }
@@ -243,6 +301,8 @@ struct ImagePreview: View {
                 }
                 first = false
                 entries = next
+                do { try self.store.save(folder: folder, entries: next) }
+                catch { self.status += " · Could not save search data" }
                 
             }
         }
@@ -264,6 +324,90 @@ enum DateFilter: String, CaseIterable {
     }
 }
 
+@MainActor final class ZoomDocument: NSView {
+    let image: CGImage
+    var boxes: [CGRect] = []
+    var selected = 0
+    override var isFlipped: Bool { true }
+    init(image: CGImage) { self.image = image; super.init(frame: .zero) }
+    required init?(coder: NSCoder) { fatalError("Not supported") }
+    func region(_ box: CGRect) -> CGRect {
+        CGRect(x: box.minX * bounds.width, y: (1 - box.maxY) * bounds.height,
+               width: box.width * bounds.width, height: box.height * bounds.height)
+    }
+    override func draw(_ rect: NSRect) {
+        NSImage(cgImage: image, size: .zero).draw(in: bounds, from: .zero, operation: .sourceOver,
+                                                fraction: 1, respectFlipped: true, hints: nil)
+        for (index, box) in boxes.enumerated() {
+            NSColor.systemYellow.withAlphaComponent(index == selected ? 0.6 : 0.2).setFill()
+            region(box).fill()
+            if index == selected {
+                NSColor.systemOrange.setStroke()
+                NSBezierPath(rect: region(box)).stroke()
+            }
+        }
+    }
+}
+
+@MainActor final class ZoomScroll: NSScrollView {
+    var zoom = 1.0
+    var reveal = true
+    override func layout() {
+        super.layout()
+        guard let document = documentView as? ZoomDocument else { return }
+        let scale = min(max(1, contentSize.width) / CGFloat(document.image.width),
+                        max(1, contentSize.height) / CGFloat(document.image.height)) * zoom
+        let size = NSSize(width: CGFloat(document.image.width) * scale,
+                          height: CGFloat(document.image.height) * scale)
+        if document.frame.size != size { document.setFrameSize(size) }
+        if reveal, document.boxes.indices.contains(document.selected) {
+            document.scrollToVisible(document.region(document.boxes[document.selected]).insetBy(dx: -30, dy: -30))
+        }
+        reveal = false
+    }
+}
+
+struct NativeZoom: NSViewRepresentable {
+    let image: CGImage
+    let boxes: [CGRect]
+    let selected: Int
+    let zoom: Double
+
+    func makeNSView(context: Context) -> ZoomScroll {
+        let scroll = ZoomScroll()
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = true
+        scroll.documentView = ZoomDocument(image: image)
+        return scroll
+    }
+    func updateNSView(_ scroll: ZoomScroll, context: Context) {
+        guard let document = scroll.documentView as? ZoomDocument else { return }
+        if document.selected != selected || scroll.zoom != zoom || document.boxes != boxes { scroll.reveal = true }
+        document.boxes = boxes
+        document.selected = selected
+        document.needsDisplay = true
+        scroll.zoom = zoom
+        scroll.needsLayout = true
+    }
+}
+
+struct ZoomedImage: View {
+    let url: URL
+    let boxes: [CGRect]
+    let selected: Int
+    let zoom: Double
+    @StateObject private var model = PreviewModel()
+    var body: some View {
+        Group {
+            if let image = model.image { NativeZoom(image: image, boxes: boxes, selected: selected, zoom: zoom) }
+            else { ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity) }
+        }.task(id: url) {
+            let image = await Task.detached { loadImage(url, limit: 6000) }.value
+            if !Task.isCancelled { model.image = image }
+        }
+    }
+}
+
 struct SearchView: View {
     @StateObject private var model = SearchModel()
     @FocusState private var searchFocused: Bool
@@ -275,6 +419,7 @@ struct SearchView: View {
                     Button("Open Folder in Finder") { if let folder = model.folder { NSWorkspace.shared.open(folder) } }
                         .disabled(model.folder == nil)
                     Divider()
+                    Button("Clear Saved Search Data", action: model.clearIndex)
                     Button("Rescan Folder") { if let folder = model.folder { model.watch(folder) } }
                         .disabled(model.folder == nil)
                 } label: {
@@ -305,7 +450,7 @@ struct SearchView: View {
                              ?? match.lines.first?.text ?? "").lineLimit(2).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button("Open") { model.selected = 0; model.opened = match }
+                    Button("Open") { model.selected = 0; model.previewZoom = 1; model.opened = match }
                 }.buttonStyle(.borderless).padding(.vertical, 3)
             }
         }.padding().frame(minWidth: 660, minHeight: 440)
@@ -331,7 +476,14 @@ struct SearchView: View {
                     Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([match.url]) }
                     Button("Close") { model.opened = nil }.keyboardShortcut(.cancelAction)
                 }
-                ImagePreview(url: match.url, boxes: boxes, limit: 2200, selected: model.selected)
+                HStack {
+                    Text("Zoom")
+                    Slider(value: $model.previewZoom, in: 1...8).frame(width: 160)
+                    Text("\(Int(model.previewZoom * 100))%").monospacedDigit()
+                    Button("Fit") { model.previewZoom = 1 }
+                    Spacer()
+                }
+                ZoomedImage(url: match.url, boxes: boxes, selected: model.selected, zoom: model.previewZoom)
             }.padding().frame(width: 820, height: 580)
         }
     }
@@ -344,6 +496,9 @@ struct SearchView: View {
     }
 }
 
+#if !MELSNAP_TEST
 @main struct MelSnap: App {
-    var body: some Scene { WindowGroup("MelSnap 0.4") { SearchView() } }
+    var body: some Scene { WindowGroup("MelSnap 0.5") { SearchView() } }
 }
+
+#endif

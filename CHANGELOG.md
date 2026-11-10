@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.5
+
+- Save the search index locally and restore the last folder on launch.
+- Reuse unchanged OCR results and provide Clear Saved Search Data.
+- Add preview zoom (100–800%), Fit, and automatic scrolling to the selected match.
+- Retry previously unreadable images on subsequent scans.
+
 ## v0.4
 
 - Filter screenshots by Today, Last 7 Days, or All Dates.
